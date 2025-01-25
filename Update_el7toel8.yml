@@ -1,0 +1,122 @@
+---
+- name: Upgrade from RHEL 7 to RHEL 8 using Leapp
+  hosts: all #any ip address
+  become: true
+
+  tasks:
+    - name: Clean previous Leapp temporary files
+      ansible.builtin.file:
+        path: /root/tmp_leapp_py3
+        state: absent
+
+    - name: List installed subscription manager products
+      ansible.builtin.command: subscription-manager list --installed
+      register: subscription_manager_list
+      ignore_errors: true
+      changed_when: false
+
+    - name: Refresh subscription manager
+      ansible.builtin.command: subscription-manager refresh
+      ignore_errors: true
+
+    - name: Enable required repositories
+      ansible.builtin.command:
+        cmd: "{{ item }}"
+      loop:
+        - subscription-manager repos --enable rhel-7-server-rpms
+        - subscription-manager repos --enable rhel-7-server-extras-rpms
+      changed_when: false
+
+    - name: Unset subscription manager release to use the latest version
+      ansible.builtin.command: subscription-manager release --unset
+      changed_when: false
+
+    - name: Clear yum versionlock
+      ansible.builtin.command: yum versionlock clear
+      ignore_errors: true
+      changed_when: false
+
+    - name: Install deltarpm package
+      ansible.builtin.yum:
+        name: deltarpm
+        state: present
+      retries: 3
+      delay: 5
+
+    - name: Update all packages to latest versions
+      ansible.builtin.yum:
+        name: "*"
+        state: latest
+
+    - name: Install Leapp and additional required packages
+      ansible.builtin.yum:
+        name:
+          - leapp
+          - leapp-repository
+          - leapp-upgrade-el7toel8
+        state: present
+      retries: 3
+      delay: 10
+
+    - name: Comment "AllowZoneDrifting" in firewalld config
+      ansible.builtin.lineinfile:
+        path: /etc/firewalld/firewalld.conf
+        regexp: "^AllowZoneDrifting"
+        line: "#AllowZoneDrifting"
+        backup: yes
+
+    - name: Ensure PermitRootLogin is set to yes in SSH config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?PermitRootLogin"
+        line: "PermitRootLogin yes"
+        backup: yes
+
+    - name: Restart SSH service to apply configuration
+      ansible.builtin.systemd:
+        name: sshd
+        state: restarted
+
+    - name: Reboot system to apply updates
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+
+    - name: Check Leapp version
+      ansible.builtin.command: leapp --version
+      register: leapp_version
+      ignore_errors: true
+      changed_when: false
+
+    - name: Remove kernel modules to avoid upgrade conflicts
+      ansible.builtin.command: modprobe -r floppy pata_acpi
+      ignore_errors: true
+
+    - name: Ensure Leapp answerfile is present
+      ansible.builtin.command: leapp answer --add --section remove_pam_pkcs11_module_check.confirm=True
+      changed_when: false
+
+    - name: Run Leapp preupgrade
+      ansible.builtin.command: leapp preupgrade
+      register: leapp_preupgrade
+      failed_when: "'Target OS version not supported' in leapp_preupgrade.stderr"
+
+    - name: Fetch Leapp preupgrade report
+      ansible.builtin.fetch:
+        src: /var/log/leapp/leapp-report.txt
+        dest: "/root/leapp-preupgrade-report-{{ ansible_fqdn }}.txt"
+        flat: true
+
+    - name: Run Leapp upgrade
+      ansible.builtin.command: leapp upgrade
+      register: leapp_upgrade
+      failed_when: "'Leapp upgrade completed with errors' in leapp_upgrade.stderr"
+
+    - name: Fetch Leapp upgrade report
+      ansible.builtin.fetch:
+        src: /var/log/leapp/leapp-report.txt
+        dest: "/root/leapp-upgrade-report-{{ ansible_fqdn }}.txt"
+        flat: true
+
+    - name: Final reboot after upgrade
+      ansible.builtin.reboot:
+        reboot_timeout: 2500
